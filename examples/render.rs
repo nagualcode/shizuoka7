@@ -2,9 +2,9 @@
 //!
 //! cargo run --release --example render -- [cart_idx] [voice_idx] [engine 0|1|2] [note] [out.wav] [secs]
 
-use dxdx7::cartridges;
-use dxdx7::dx7::{Engine, Settings};
-use dxdx7::enums::EngineSw;
+use shizuoka7::cartridges;
+use shizuoka7::dx7::{Engine, Settings};
+use shizuoka7::enums::EngineSw;
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();

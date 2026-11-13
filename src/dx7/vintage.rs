@@ -1,11 +1,14 @@
 //! DX7 Mark I output path: what happens to the sound after the OPS chip.
 //! Constants are documented in `docs/HARDWARE.md` with their sources.
 //!
-//! core rate (49.1 kHz)                     host rate
-//! each voice -> own DAC conversion --> S&H + resample -> output filter -> out amp
-//!               (sign + 11-bit mantissa   (ZOH droop)     (5th-order       (hiss,
-//!                + 2-bit exponent,                         reconstruction   coupling cap,
-//!                `synth::dx7_dac`)                         low-pass)        optional drive)
+//! core rate (49.1 kHz)                                      host rate
+//! each voice -> own DAC conversion -> scaler -> S&H -> output filter -> out amp
+//!               (12-bit code with      (/1../8,  (voice   (5th order,     (hiss,
+//!                bit-weight errors,     passes    slots    causal: rings   coupling cap,
+//!                `synth::dx7_dac`)      the DAC   summed)  after, never    optional drive)
+//!                                       noise)             before)
+//!
+//! The scaler, S&H and filter are linear and live in the resampler kernel.
 
 /// DX7 sample rate: 9.4265 MHz master clock / 192.
 pub const DX7_SAMPLE_RATE: f64 = 9_426_500.0 / 192.0;
@@ -39,18 +42,28 @@ impl OnePole {
 pub const OUT_POLE_HZ: f64 = 6788.0;
 pub const OUT_PAIRS: [(f64, f64); 2] = [(11588.0, 1.017), (16062.0, 4.13)];
 
-/// Magnitude of the analog output filter at `f` Hz (embedded in the
-/// resampler kernel, see `resample.rs`).
-pub fn output_filter_response(f: f64) -> f64 {
+/// Transfer function (re, im) of the analog output filter at `f` Hz
+/// (embedded in the resampler kernel, see `resample.rs`).
+pub fn output_filter(f: f64) -> (f64, f64) {
+    // 1 / (1 + jw)
     let w = f / OUT_POLE_HZ;
-    let mut h = 1.0 / (1.0 + w * w).sqrt();
+    let d = 1.0 + w * w;
+    let (mut re, mut im) = (1.0 / d, -w / d);
     for (fc, q) in OUT_PAIRS {
+        // 1 / (1 - w^2 + jw/Q)
         let w = f / fc;
-        let re = 1.0 - w * w;
-        let im = w / q;
-        h /= (re * re + im * im).sqrt();
+        let (a, b) = (1.0 - w * w, w / q);
+        let d = a * a + b * b;
+        let (sr, si) = (a / d, -b / d);
+        (re, im) = (re * sr - im * si, re * si + im * sr);
     }
-    h
+    (re, im)
+}
+
+/// Magnitude of the analog output filter at `f` Hz.
+pub fn output_filter_response(f: f64) -> f64 {
+    let (re, im) = output_filter(f);
+    re.hypot(im)
 }
 
 /// Analog output stage at the host rate (after the reconstruction filter).
@@ -67,10 +80,16 @@ pub struct Analog {
 
 /// Output coupling capacitor corner (not documented; typical value).
 const HPF_HZ: f64 = 8.0;
-/// Hiss at the output relative to one full-level carrier (0.125 FS):
-/// about -84 dBFS RMS. No published measurement exists - this is an
-/// estimate; set Analog Noise to 0 for a clean output.
-const HISS: f32 = 4.0e-5;
+/// Hiss of the op-amps after the filter: constant, about -90 dBFS RMS. No
+/// published measurement exists - this is an estimate; set Analog Noise
+/// to 0 for a clean output.
+const HISS: f32 = 3.0e-5;
+/// Noise of the DAC and its current-to-voltage amplifier, as it reaches
+/// the output with all sixteen voice slots idle (RMS of white noise at the
+/// core rate). It sits before the /1../8 scaler, so it comes up by up to
+/// 18 dB under loud voices and sinks back as they decay - the "breathing"
+/// floor of a gain-ranged converter. Estimate, like `HISS`.
+pub const DAC_NOISE: f32 = 2.2e-5;
 
 impl Analog {
     pub fn new(sr: f64) -> Self {
@@ -89,7 +108,7 @@ impl Analog {
     }
 
     #[inline]
-    fn white(&mut self) -> f32 {
+    pub fn white(&mut self) -> f32 {
         let mut x = self.rng;
         x ^= x << 13;
         x ^= x >> 17;

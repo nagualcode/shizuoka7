@@ -58,6 +58,8 @@ pub struct Settings {
     pub hw_pitch: bool,
     pub carrier_norm: bool,
     pub lfo_steps: bool,
+    /// Per-sample EGS envelopes (Vintage).
+    pub hw_env: bool,
 }
 
 impl Default for Settings {
@@ -83,19 +85,21 @@ impl Default for Settings {
             out_filter: true,
             noise: 1.0,
             drive: 0.0,
-            tolerance: 0.0,
+            tolerance: 0.3,
             hw_pitch: true,
             carrier_norm: true,
             lfo_steps: true,
+            hw_env: true,
         }
     }
 }
 
-/// 15-bit DAC units to float. A full-scale voice (16384) lands at 0.25.
-/// With the DX7's carrier scaling a voice never exceeds that, whatever the
-/// algorithm; 0.25 makes a typical two-carrier voice as loud as in
-/// Mark I / Dexed, so switching engines doesn't jump in level.
-const VINT_SCALE: f32 = 0.25 / 16384.0;
+/// 15-bit DAC units to float. The chip's full scale (16384) lands at 0.5;
+/// a level-99 carrier peaks at half of that, and with the DX7's carrier
+/// scaling a voice never exceeds full scale, whatever the algorithm. This
+/// makes a typical two-carrier voice as loud as in Mark I / Dexed, so
+/// switching engines doesn't jump in level.
+const VINT_SCALE: f32 = 0.5 / 16384.0;
 
 /// Fade-out before voices are freed on a preset change (no click).
 const RESET_FADE_SECS: f64 = 0.005;
@@ -130,10 +134,10 @@ impl Engine {
             host_sr,
             settings,
             synth: Synth::new(core_sr, kernel),
-            block: Block { mix: [0.0; N], vint: [0.0; N] },
+            block: Block::new(),
             pos: N,
             fx: PluginFx::new(host_sr as f32),
-            resampler: Resampler::new(DX7_SAMPLE_RATE, host_sr, vintage::output_filter_response),
+            resampler: Resampler::new(DX7_SAMPLE_RATE, host_sr, vintage::output_filter),
             analog: Analog::new(host_sr),
             fade: 0,
             fade_len: ((host_sr * RESET_FADE_SECS) as u32).max(1),
@@ -199,13 +203,23 @@ impl Engine {
         if s.tolerance != self.settings.tolerance || force {
             // 0.1 % ladder resistors: up to +-0.2 % per range at full tolerance.
             dac_gain = [1.0, 1.0 + 0.0021 * s.tolerance, 1.0 - 0.0017 * s.tolerance, 1.0 + 0.0013 * s.tolerance];
+            self.set_dac_errors(s.tolerance);
         }
         let hw = if vintage {
-            HwModel { dac: s.dac, dac_gain, carrier_norm: s.carrier_norm, hw_pitch: s.hw_pitch, lfo_steps: s.lfo_steps }
+            HwModel {
+                dac: s.dac,
+                dac_gain,
+                carrier_norm: s.carrier_norm,
+                hw_pitch: s.hw_pitch,
+                lfo_steps: s.lfo_steps,
+                hw_env: s.hw_env,
+                dac_bits: s.tolerance > 0.0,
+            }
         } else {
             HwModel { dac_gain, ..HwModel::OFF }
         };
         self.synth.hw = hw;
+        self.synth.vintage_out = vintage;
         self.resampler.filter = s.out_filter;
         self.analog.noise = s.noise;
         self.analog.drive = s.drive;
@@ -213,6 +227,29 @@ impl Engine {
             self.set_tolerance(s.tolerance);
         }
         self.settings = *s;
+    }
+
+    /// Bit-weight errors of the 12-bit R-2R DAC (BA9221, about +-1/2 LSB
+    /// linearity when new). The biggest step is at the major carry, which
+    /// in two's complement is the zero crossing - and the scaler brings
+    /// quiet voices back up to the full code range, so every voice crosses
+    /// it at every level: a little crossover grit that follows the signal
+    /// down. One fixed "unit": the errors only scale with the amount.
+    fn set_dac_errors(&mut self, amount: f32) {
+        // LSBs at full tolerance, MSB first: the upper bits carry the
+        // error, as their resistors need the tightest match.
+        const BIT_ERR: [f32; 12] = [0.46, -0.31, 0.22, -0.13, 0.09, -0.05, 0.03, 0.02, -0.01, 0.0, 0.0, 0.0];
+        let lut = &mut self.synth.dac_err;
+        for (u, e) in lut.iter_mut().enumerate() {
+            let mut acc = 0.0;
+            for (b, w) in BIT_ERR.iter().enumerate() {
+                if u & (0x800 >> b) != 0 {
+                    acc += w;
+                }
+            }
+            // Code 0 (offset binary 0x800) stays exactly zero.
+            *e = (acc - BIT_ERR[0]) * amount;
+        }
     }
 
     /// Per-voice pitch offsets: each of the 16 voice slots of a real unit
@@ -227,7 +264,9 @@ impl Engine {
             seed ^= seed >> 17;
             seed ^= seed << 5;
             let r = (seed as f32 / u32::MAX as f32) * 2.0 - 1.0;
-            let cents = amount * 1.5 * r;
+            // Squared: next to nothing at the default amount, where only
+            // the converter errors (which every unit has) should be heard.
+            let cents = amount * amount * 1.5 * r;
             *o = (cents / 1200.0 * (1 << 24) as f32) as i32;
         }
     }
@@ -258,8 +297,7 @@ impl Engine {
     /// the old sound plays after the fade.
     fn cut_voices(&mut self) {
         self.synth.panic();
-        self.block.mix = [0.0; N];
-        self.block.vint = [0.0; N];
+        self.block = Block::new();
         self.resampler.clear();
     }
 
@@ -329,13 +367,19 @@ impl Engine {
         let y = match self.settings.engine {
             EngineSw::Modern | EngineSw::MarkI => self.next_core_mix(),
             EngineSw::Vintage => {
-                let Self { resampler, synth, block, pos, .. } = self;
+                let Self { resampler, synth, block, pos, analog, .. } = self;
+                let dac_noise = if synth.hw.dac == DacSw::Dx7 { analog.noise * vintage::DAC_NOISE } else { 0.0 };
                 let x = resampler.next(|| {
                     if *pos >= N {
                         synth.render(block);
                         *pos = 0;
                     }
-                    let v = block.vint[*pos] * VINT_SCALE;
+                    let mut v = block.vint[*pos] * VINT_SCALE;
+                    if dac_noise > 0.0 {
+                        // Converter noise through the analog scaler (and
+                        // then the output filter, like the signal).
+                        v += dac_noise * block.dac_noise[*pos].sqrt() * analog.white();
+                    }
                     *pos += 1;
                     v
                 });

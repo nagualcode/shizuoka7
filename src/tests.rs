@@ -344,9 +344,10 @@ fn output_filter_matches_dx7_response() {
     // Measured through the whole Vintage path (DAC off-path: Clean) at 48
     // kHz relative to 1 kHz, the ZOH droop included (-1.4 dB @ 15 kHz).
     use crate::dx7::resample::Resampler;
-    use crate::dx7::vintage::{DX7_SAMPLE_RATE, output_filter_response};
+    use crate::dx7::resample::HOLD;
+    use crate::dx7::vintage::{DX7_SAMPLE_RATE, output_filter, output_filter_response};
     for host in [44100.0, 48000.0, 96000.0] {
-        let mut r = Resampler::new(DX7_SAMPLE_RATE, host, output_filter_response);
+        let mut r = Resampler::new(DX7_SAMPLE_RATE, host, output_filter);
         let mut gain_db = |f: f64| {
             let mut n = 0u64;
             let mut acc = 0.0;
@@ -363,7 +364,7 @@ fn output_filter_matches_dx7_response() {
             10.0 * (acc / (total - total / 4 - 1) as f64 / 0.5).log10()
         };
         let zoh = |f: f64| {
-            let x = std::f64::consts::PI * f / DX7_SAMPLE_RATE;
+            let x = std::f64::consts::PI * f * HOLD / DX7_SAMPLE_RATE;
             20.0 * (x.sin() / x).log10()
         };
         let mut checks = vec![(1000.0, 0.0), (10000.0, 20.0 * output_filter_response(10000.0).log10()), (15000.0, 0.8), (17000.0, -3.0)];
@@ -375,4 +376,101 @@ fn output_filter_matches_dx7_response() {
             assert!((g - want).abs() < 0.5, "{host}: {f} Hz: {g:.2} dB, want {want}");
         }
     }
+}
+
+#[test]
+fn output_filter_rings_after_not_before() {
+    // The analog filter is causal: a click is followed by its 16 kHz
+    // ringing, not preceded by it.
+    use crate::dx7::resample::Resampler;
+    use crate::dx7::vintage::{DX7_SAMPLE_RATE, output_filter};
+    for host in [44100.0, 48000.0, 96000.0] {
+        let mut r = Resampler::new(DX7_SAMPLE_RATE, host, output_filter);
+        let mut n = 0;
+        let y: Vec<f32> = (0..600)
+            .map(|_| {
+                r.next(|| {
+                    n += 1;
+                    if n == 100 { 1.0 } else { 0.0 }
+                })
+            })
+            .collect();
+        let (pk, pv) = y.iter().enumerate().fold((0, 0f32), |m, (i, v)| if v.abs() > m.1 { (i, v.abs()) } else { m });
+        let guard = (6.0 * host / 48000.0) as usize;
+        let pre = y[..pk - guard].iter().fold(0f32, |m, v| m.max(v.abs())) / pv;
+        let post = y[pk + guard..].iter().fold(0f32, |m, v| m.max(v.abs())) / pv;
+        assert!(pre < 0.02 && pre < post / 3.0, "{host}: pre-ringing {pre}, post {post}");
+        assert!(post > 0.03, "{host}: no ringing after the click ({post})");
+    }
+}
+
+#[test]
+fn egs_envelope_decays_at_the_measured_rate() {
+    // MSFA's measurement of a DX7: decay = 0.2819 * 2^(qrate/4) *
+    // (1 + 0.25 * (qrate % 4)) dB/s, one envelope unit = 6.02 dB / 256.
+    use crate::dx7::env::EgsEnv;
+    use crate::dx7::tables::N;
+    use crate::dx7::vintage::DX7_SAMPLE_RATE;
+    for rate in [30, 45, 50, 60, 70, 80] {
+        let qrate = (rate * 41) >> 6;
+        let mut e = EgsEnv::default();
+        // Full level, then a release towards silence at `rate`.
+        e.init([99, 99, 99, rate], [99, 99, 99, 0], 4064, 0);
+        let mut buf = [0i32; N];
+        let mut clock = 0u32;
+        for _ in 0..64 {
+            e.fill(clock, &mut buf);
+            clock += N as u32;
+        }
+        assert_eq!(e.level(), 256, "level 99 is 6 dB below the chip's full scale");
+        e.keydown(false);
+        let start = e.level();
+        let blocks = 256;
+        for _ in 0..blocks {
+            e.fill(clock, &mut buf);
+            clock += N as u32;
+        }
+        let secs = (blocks * N) as f64 / DX7_SAMPLE_RATE;
+        let got = f64::from(e.level() - start) * 6.0206 / 256.0 / secs;
+        let want = 0.2819 * 2f64.powi(qrate >> 2) * (1.0 + 0.25 * f64::from(qrate & 3));
+        if e.level() < 0xFF0 {
+            assert!((got / want - 1.0).abs() < 0.03, "rate {rate}: {got:.1} dB/s, want {want:.1}");
+        }
+    }
+}
+
+#[test]
+fn egs_attack_is_faster_than_a_block() {
+    // Rate 99 on the chip reaches full level within a millisecond; a
+    // block envelope cannot be faster than its 64-sample ramp.
+    use crate::dx7::env::EgsEnv;
+    use crate::dx7::tables::N;
+    let mut e = EgsEnv::default();
+    e.init([99, 99, 99, 99], [99, 99, 99, 0], 4064, 0);
+    let mut buf = [0i32; N];
+    e.fill(0, &mut buf);
+    let n = buf.iter().position(|&l| l == 256).expect("attack not finished in one block");
+    assert!(n < 40, "attack took {n} samples");
+}
+
+#[test]
+fn converter_noise_follows_the_voices() {
+    // The DAC's noise passes the analog scaler: louder while a voice is
+    // loud, back down once it has decayed.
+    let run = |play: bool| {
+        let mut e = Engine::new(SR);
+        e.apply_settings(&Settings { engine: EngineSw::Vintage, noise: 1.0, tolerance: 0.0, ..Settings::default() }, true);
+        let mut v = sysex::init_voice();
+        v[5 * 21 + 18] = 0; // OP1 at 0.5: a low sine, far from the band measured
+        e.set_patch(&v);
+        if play {
+            e.note_on(24, 127);
+        }
+        let x = render(&mut e, 48000);
+        // Noise above 6 kHz (the note is a 16 Hz sine): first difference.
+        let hf: f64 = x[24000..].windows(3).map(|w| f64::from(w[0] - 2.0 * w[1] + w[2]).powi(2)).sum();
+        10.0 * hf.log10()
+    };
+    let d = run(true) - run(false);
+    assert!(d > 2.0, "noise floor did not rise under a loud voice: {d:.1} dB");
 }

@@ -1,4 +1,4 @@
-# Builds and tests DXDX7 on macOS, Windows and Linux.
+# Builds and tests Shizuoka7 on macOS, Windows and Linux.
 #
 # - Every push to main and every pull request: test + build the bundles
 #   (downloadable from the run page as workflow artifacts).
@@ -98,9 +98,9 @@ jobs:
         shell: bash
         run: |
           VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          NAME="DXDX7-${VERSION}-${{ matrix.slug }}"
+          NAME="Shizuoka7-${VERSION}-${{ matrix.slug }}"
           mkdir -p "dist/$NAME"
-          for b in target/bundles/DXDX7.*; do cp -R "$b" "dist/$NAME/"; done
+          for b in target/bundles/Shizuoka7.*; do cp -R "$b" "dist/$NAME/"; done
           cp LICENSE "dist/$NAME/"
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then
@@ -127,5 +127,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "DXDX7 ${TAG#v}" --generate-notes || true
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Shizuoka7 ${TAG#v}" --generate-notes || true
           gh release upload "$TAG" "${{ steps.pkg.outputs.zip }}" --clobber

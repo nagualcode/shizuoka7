@@ -1,16 +1,16 @@
 [package]
-name = "dxdx7"
-version = "0.2.1"
+name = "shizuoka7"
+version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-description = "Yamaha DX7 for modern DAWs: a Rust port of Dexed with a DX7 hardware output model, built with truce"
+description = "Shizuoka7: a DX7 for modern DAWs - a Rust port of Dexed with a model of the Mark I hardware (EGS envelopes, gain-ranged DAC, analog output filter), built with truce"
 authors = ["Jardim Sonoro"]
 
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [[bin]]
-name = "dxdx7-standalone"
+name = "shizuoka7-standalone"
 path = "src/main.rs"
 required-features = ["standalone"]
 

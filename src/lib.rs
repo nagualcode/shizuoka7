@@ -1,4 +1,4 @@
-//! DXDX7 - a Yamaha DX7 for modern DAWs, a Rust port of Dexed built with
+//! Shizuoka7 - a Yamaha DX7 for modern DAWs, a Rust port of Dexed built with
 //! truce.
 //!
 //! Plugin layer: host parameters, MIDI and the editor. The sound engine is
@@ -125,6 +125,7 @@ fn read_settings(p: &DxParams) -> Settings {
         hw_pitch: p.hw_pitch.value(),
         carrier_norm: p.carrier_norm.value(),
         lfo_steps: p.lfo_steps.value(),
+        hw_env: p.hw_env.value(),
     }
 }
 
@@ -148,20 +149,20 @@ fn store_voice(p: &DxParams, v: &sysex::Voice) {
 /// This many voice bytes changing in one block counts as a preset change.
 const PRESET_CHANGE_BYTES: usize = 8;
 
-pub struct DxDx7 {
+pub struct Shizuoka7 {
     engine: Box<Engine>,
     voice: sysex::Voice,
     peak: [f32; 2],
     sysex_buf: Vec<u8>,
 }
 
-impl Default for DxDx7 {
+impl Default for Shizuoka7 {
     fn default() -> Self {
         Self { engine: Box::default(), voice: [0; 156], peak: [0.0; 2], sysex_buf: Vec::with_capacity(4200) }
     }
 }
 
-impl DxDx7 {
+impl Shizuoka7 {
     fn sync(&mut self, params: &DxParams) {
         let mut v = self.voice;
         params.read_voice(&mut v);
@@ -224,7 +225,7 @@ impl DxDx7 {
     }
 }
 
-impl PluginLogic for DxDx7 {
+impl PluginLogic for Shizuoka7 {
     type Params = DxParams;
     type DspState = Self;
 
@@ -281,7 +282,7 @@ impl PluginLogic for DxDx7 {
 }
 
 truce::plugin! {
-    logic: DxDx7,
+    logic: Shizuoka7,
     params: DxParams,
 }
 

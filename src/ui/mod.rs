@@ -237,7 +237,7 @@ impl DxUi {
         for (k, c) in [DX_RED, CARRIER, ACCENT].into_iter().enumerate() {
             p.rect_filled(Rect::from_min_size(pos2(x0, bar.top() + 9.0 + k as f32 * 6.0), vec2(16.0, 3.0)), CornerRadius::same(1), c);
         }
-        p.text(pos2(x0 + 22.0, bar.center().y), Align2::LEFT_CENTER, "DXDX7", font(17.0), TEXT);
+        p.text(pos2(x0 + 22.0, bar.center().y), Align2::LEFT_CENTER, "SHIZUOKA7", font(17.0), TEXT);
 
         let (cart_name, builtin, program, cart, voice_name) = match s.params().patch.read() {
             Ok(st) => (st.cart_name.clone(), st.builtin, st.program as usize, st.cartridge(), st.voice_name.clone()),
@@ -247,8 +247,8 @@ impl DxUi {
         let h = 22.0;
 
         // Cartridge browser.
-        let mut x = x0 + 92.0;
-        let cart_r = Rect::from_min_size(pos2(x, cy), vec2(150.0, h));
+        let mut x = x0 + 132.0;
+        let cart_r = Rect::from_min_size(pos2(x, cy), vec2(128.0, h));
         let mut pick_cart = None;
         ui.scope_builder(egui::UiBuilder::new().max_rect(cart_r), |ui| {
             egui::ComboBox::from_id_salt("cart")
@@ -273,7 +273,7 @@ impl DxUi {
             self.select_program(s, (program + 31) % 32);
         }
         x += 22.0;
-        let prog_r = Rect::from_min_size(pos2(x, cy), vec2(176.0, h));
+        let prog_r = Rect::from_min_size(pos2(x, cy), vec2(160.0, h));
         let mut pick_prog = None;
         ui.scope_builder(egui::UiBuilder::new().max_rect(prog_r), |ui| {
             egui::ComboBox::from_id_salt("prog")
@@ -301,7 +301,7 @@ impl DxUi {
         // Voice name (10 characters, DX7 character set).
         p.text(pos2(x, bar.center().y), Align2::LEFT_CENTER, "NAME", font(9.5), DIM);
         x += 32.0;
-        let name_r = Rect::from_min_size(pos2(x, cy), vec2(98.0, h));
+        let name_r = Rect::from_min_size(pos2(x, cy), vec2(92.0, h));
         let name_id = ui.id().with("voice-name");
         if !ui.memory(|m| m.has_focus(name_id)) && self.name_buf != voice_name.trim_end() {
             self.name_buf = voice_name.trim_end().to_string();
@@ -790,13 +790,16 @@ fn vintage_section(ui: &mut egui::Ui, s: &Ctx, r: Rect) {
     let c = section(ui, r, if vintage { "DX7 HARDWARE MODEL" } else { "DX7 HARDWARE MODEL  (select DX7 VINTAGE)" });
     let p = ui.painter().clone();
     // DAC (default DX7 Mk I).
-    let d = grid(c, 4, 0, 0).union(grid(c, 4, 1, 0));
+    // DAC takes 38 % of the row, the five circuit switches the rest.
+    let row = grid(c, 4, 0, 0).union(grid(c, 4, 3, 0));
+    let split = row.left() + row.width() * 0.38;
+    let d = Rect::from_min_max(row.min, pos2(split - 4.0, row.bottom()));
     p.text(pos2(d.center().x, d.top()), Align2::CENTER_TOP, "DAC", font(9.5), DIM);
     selector(ui, s, Rect::from_min_size(pos2(d.left(), d.top() + 13.0), vec2(d.width(), 20.0)), P::Dac, &["CLEAN", "MK I", "12-BIT"]);
-    let t = grid(c, 4, 2, 0).union(grid(c, 4, 3, 0));
+    let t = Rect::from_min_max(pos2(split + 4.0, row.top()), row.max);
     p.text(pos2(t.center().x, t.top()), Align2::CENTER_TOP, "CIRCUIT", font(9.5), DIM);
-    let tw = (t.width() - 9.0) / 4.0;
-    for (k, (id, l)) in [(P::OutFilter, "FILTER"), (P::HwPitch, "PITCH"), (P::CarrierNorm, "CARR"), (P::LfoSteps, "LFO")].into_iter().enumerate() {
+    let tw = (t.width() - 12.0) / 5.0;
+    for (k, (id, l)) in [(P::OutFilter, "FILT"), (P::HwPitch, "TUNE"), (P::CarrierNorm, "CARR"), (P::LfoSteps, "LFO"), (P::HwEnv, "EG")].into_iter().enumerate() {
         toggle(ui, s, Rect::from_min_size(pos2(t.left() + k as f32 * (tw + 3.0), t.top() + 13.0), vec2(tw, 20.0)), id, l);
     }
     let w = c.width() / 3.0;

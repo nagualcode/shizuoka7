@@ -223,3 +223,237 @@ impl PitchEnv {
         }
     }
 }
+
+/// The envelope generator of the EGS chip (YM21290), one step per sample.
+///
+/// Port of VDX7's `Envelope` (chiaccona, GPL-3), which follows the MSFA
+/// measurements: a 12-bit attenuation (0 = full level, 0xFF0 = silent, one
+/// unit = 6.02 dB / 256) that moves in whole steps, clocked by one counter
+/// shared by every envelope of the instrument. Unlike the block envelope
+/// above there is no interpolation: slow rates are a staircase of single
+/// units, fast attacks land within a few samples.
+#[derive(Clone, Copy)]
+pub struct EgsEnv {
+    /// EGS rate registers (0..63) and level registers (0..63, attenuation).
+    rates: [u8; 4],
+    levels: [u8; 4],
+    /// Operator output attenuation (level, scaling and velocity), 12-bit units.
+    outatt: i32,
+    rate_scaling: i32,
+    level: i32,
+    target: i32,
+    rising: bool,
+    stage: u8,
+    keyoff: bool,
+    /// Short version of the stage-1 delay (see `update_level`).
+    compress: bool,
+    nshift: u32,
+    pshift: u32,
+    small: u32,
+    mask: u32,
+}
+
+/// Silent: attenuation 4096 - 16.
+pub const EGS_OFF: i32 = 0xFF0;
+/// Clock patterns for the four quarter-steps of a rate.
+const EGS_MASK: [u32; 4] = [0xAA, 0xEA, 0xEE, 0xFE];
+
+impl Default for EgsEnv {
+    fn default() -> Self {
+        Self {
+            rates: [0; 4],
+            levels: [63; 4],
+            outatt: EGS_OFF,
+            rate_scaling: 0,
+            level: EGS_OFF,
+            target: EGS_OFF,
+            rising: false,
+            stage: 3,
+            keyoff: true,
+            compress: true,
+            nshift: 0,
+            pshift: 0,
+            small: 0,
+            mask: 0xAA,
+        }
+    }
+}
+
+impl EgsEnv {
+    /// Load the registers from patch values (rates and levels 0..99,
+    /// `outlevel` and `rate_scaling` as computed for the block envelope).
+    fn load(&mut self, rates: [i32; 4], levels: [i32; 4], outlevel: i32, rate_scaling: i32) {
+        for i in 0..4 {
+            self.rates[i] = ((rates[i].clamp(0, 99) * 41) >> 6) as u8;
+            self.levels[i] = (63 - (scale_out_level(levels[i].clamp(0, 99)) >> 1)) as u8;
+        }
+        // msfa level = 4096 - attenuation: (L << 6) + outlevel - 4256.
+        self.outatt = 4320 - outlevel;
+        self.rate_scaling = rate_scaling;
+    }
+
+    /// Key on. The level carries over from whatever the envelope was doing
+    /// (a re-used voice attacks from where it is, as on the chip).
+    pub fn init(&mut self, rates: [i32; 4], levels: [i32; 4], outlevel: i32, rate_scaling: i32) {
+        self.load(rates, levels, outlevel, rate_scaling);
+        self.keyoff = false;
+        if self.stage == 3 {
+            self.advance();
+        } else {
+            // Retrigger without a key-off in between.
+            self.stage = 0;
+            self.compress = false;
+            self.update_level();
+            self.update_rate();
+        }
+    }
+
+    /// Live edit on a sounding note: the registers are rewritten.
+    pub fn update(&mut self, rates: [i32; 4], levels: [i32; 4], outlevel: i32, rate_scaling: i32) {
+        self.load(rates, levels, outlevel, rate_scaling);
+        self.update_level();
+        self.update_rate();
+    }
+
+    pub fn keydown(&mut self, d: bool) {
+        if self.keyoff == d {
+            self.keyoff = !d;
+            self.advance();
+        }
+    }
+
+    /// Back to silence at once (voice reset).
+    pub fn kill(&mut self) {
+        *self = Self::default();
+    }
+
+    fn advance(&mut self) {
+        match self.stage {
+            0 => {
+                if self.keyoff {
+                    self.stage = 3;
+                    self.compress = true;
+                } else {
+                    self.stage = 1;
+                    self.compress = false;
+                }
+            }
+            1 => self.stage = if self.keyoff { 3 } else { 2 },
+            2 => {
+                if !self.keyoff {
+                    return;
+                }
+                self.stage = 3;
+            }
+            _ => {
+                if self.keyoff {
+                    return;
+                }
+                self.stage = 0;
+            }
+        }
+        self.update_level();
+        self.update_rate();
+    }
+
+    fn update_level(&mut self) {
+        let st = usize::from(self.stage);
+        self.target = ((i32::from(self.levels[st]) << 6) + self.outatt).clamp(0, EGS_OFF);
+        // Two low levels in a row (patch level below 20) are heard as a
+        // delay: the chip runs 479 decay steps instead (Massey, "The
+        // Complete DX7", p. 117). A stage-0 delay is shortened to 15 steps
+        // when the previous one was cut short by a key-off.
+        let prev = (st + 3) & 3;
+        if st < 2 && self.levels[st] >= 40 && self.levels[prev] >= 40 {
+            let delay = if st == 0 && self.compress { 15 } else { 479 };
+            self.target = self.level + delay;
+            if self.target > EGS_OFF {
+                self.level = EGS_OFF - delay;
+                self.target = EGS_OFF;
+            }
+        }
+        self.rising = self.target < self.level;
+    }
+
+    fn update_rate(&mut self) {
+        let qrate = (i32::from(self.rates[usize::from(self.stage)]) + self.rate_scaling).clamp(0, 63) as u32;
+        if qrate < 44 {
+            self.nshift = 11 - (qrate >> 2);
+            self.pshift = 0;
+            self.small = (1 << self.nshift) - 1;
+        } else {
+            self.nshift = 0;
+            self.pshift = (qrate >> 2) - 11;
+            self.small = 0;
+        }
+        self.mask = EGS_MASK[(qrate & 3) as usize];
+    }
+
+    /// Holding a level: nothing moves until the next key event.
+    #[inline]
+    fn resting(&self) -> bool {
+        self.stage > 1 && self.level == self.target
+    }
+
+    /// One sample; `clock` is the instrument's envelope counter.
+    #[inline]
+    fn step(&mut self, clock: u32) {
+        if clock & self.small != 0 || self.mask & (1 << ((clock >> self.nshift) & 7)) == 0 {
+            return;
+        }
+        if self.rising {
+            // Attack: start 40 dB up, then close in faster the quieter it is.
+            if self.level > 0x94C {
+                self.level = 0x94C;
+            }
+            self.level -= ((self.level >> 8) + 2) << self.pshift;
+            if self.level <= self.target {
+                self.level = self.target;
+                self.advance();
+            }
+        } else {
+            self.level += 1 << self.pshift;
+            if self.level >= self.target {
+                self.level = self.target;
+                self.advance();
+            }
+        }
+    }
+
+    /// Attenuation for each sample of a block starting at `clock`.
+    pub fn fill(&mut self, clock: u32, out: &mut [i32; N]) {
+        let mut i = 0;
+        while i < N {
+            if self.resting() {
+                out[i..].fill(self.level);
+                return;
+            }
+            let c = clock.wrapping_add(i as u32);
+            // Slow rates tick once every `small + 1` samples: skip ahead.
+            let wait = (c.wrapping_neg() & self.small) as usize;
+            if wait > 0 {
+                let end = (i + wait).min(N);
+                out[i..end].fill(self.level);
+                i = end;
+                continue;
+            }
+            self.step(c);
+            out[i] = self.level;
+            i += 1;
+        }
+    }
+
+    pub fn level(&self) -> i32 {
+        self.level
+    }
+
+    /// Active until the release has reached L4, or forever when L4 > 0.
+    pub fn is_active(&self) -> bool {
+        !(self.stage == 3 && self.level == self.target) || self.levels[3] < 63
+    }
+
+    /// 0..3 while running, 4 when the release is over (as `Env::stage`).
+    pub fn stage(&self) -> usize {
+        if self.stage == 3 && self.level == self.target { 4 } else { usize::from(self.stage) }
+    }
+}

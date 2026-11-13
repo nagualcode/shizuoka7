@@ -1,13 +1,13 @@
 [vendor]
 name = "Jardim Sonoro"
 id = "com.jardimsonoro"
-url = "https://github.com/nagualcode/dxdx7"
+url = "https://github.com/nagualcode/shizuoka7"
 au_manufacturer = "JdSn"
 
 [[plugin]]
-name = "DXDX7"
-bundle_id = "dxdx7"
-crate = "dxdx7"
+name = "Shizuoka7"
+bundle_id = "shizuoka7"
+crate = "shizuoka7"
 category = "instrument"
 description = """
 Yamaha DX7 emulation: a Rust port of Dexed (6-operator FM, 32 algorithms, \
@@ -15,6 +15,6 @@ DX7 cartridge SysEx compatible) with a model of the DX7 Mark I output \
 hardware: 49.1 kHz engine clock, gain-ranged 12-bit DAC, sample-and-hold \
 and analog output stage.
 """
-fourcc = "DXD7"
+fourcc = "Shz7"
 au_tag = "Synthesizer"
 vst3_subcategory = "Instrument|Synth"

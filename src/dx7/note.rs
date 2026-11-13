@@ -3,7 +3,7 @@
 //! LFO and controller modulation.
 
 use super::core::{Core, Kernel, OpParams, is_carrier};
-use super::env::{Env, PitchEnv, scale_out_level};
+use super::env::{EGS_OFF, EgsEnv, Env, PitchEnv, scale_out_level};
 use super::tables::{N, Rates};
 
 const FEEDBACK_BITDEPTH: i32 = 8;
@@ -262,6 +262,9 @@ pub struct Dx7Note {
     pub pitch_offset: i32,
     /// DX7 pitch grid and firmware frequency tables (Vintage).
     pub hw_pitch: bool,
+    /// Per-sample EGS envelopes instead of Dexed's block envelope (Vintage).
+    pub hw_env: bool,
+    egs: [EgsEnv; 6],
 }
 
 impl Dx7Note {
@@ -308,7 +311,11 @@ impl Dx7Note {
         for op in 0..6 {
             let off = op * 21;
             let (rates, levels, outlevel, rs) = Self::op_levels(patch, off, midinote, velocity);
-            self.env[op].init(r, rates, levels, outlevel, rs);
+            if self.hw_env {
+                self.egs[op].init(rates, levels, outlevel, rs);
+            } else {
+                self.env[op].init(r, rates, levels, outlevel, rs);
+            }
             let mode = i32::from(patch[off + 17]);
             let freq = self.freq_of(midinote, mode, patch, off);
             self.op_mode[op] = mode;
@@ -335,7 +342,11 @@ impl Dx7Note {
             self.ampmodsens[op] = AMPMODSENS_TAB[usize::from(patch[off + 14] & 3)];
             self.op_mode[op] = mode;
             let (rates, levels, outlevel, rs) = Self::op_levels(patch, off, midinote, velocity);
-            self.env[op].update(rates, levels, outlevel, rs);
+            if self.hw_env {
+                self.egs[op].update(rates, levels, outlevel, rs);
+            } else {
+                self.env[op].update(rates, levels, outlevel, rs);
+            }
         }
         self.voice_globals(patch);
     }
@@ -344,8 +355,9 @@ impl Dx7Note {
         self.porta_curpitch = src.porta_curpitch;
     }
 
-    /// Render one block into `buf` (overwritten).
-    pub fn compute(&mut self, r: &Rates, core: &mut Core, kernel: Kernel, buf: &mut [i32; N], lfo_val: i32, lfo_delay: i32, ctrls: &Controllers, carrier_norm: bool) {
+    /// Render one block into `buf` (overwritten). `clock` is the
+    /// instrument's envelope counter at the start of the block.
+    pub fn compute(&mut self, r: &Rates, core: &mut Core, kernel: Kernel, buf: &mut [i32; N], lfo_val: i32, lfo_delay: i32, ctrls: &Controllers, carrier_norm: bool, clock: u32) {
         let hw = self.hw_pitch;
         let q = move |x: i32| if hw { hw_quantize(x) } else { x };
         // ---- pitch ----
@@ -367,7 +379,10 @@ impl Dx7Note {
                 pb = (pb * (8191 / stp)) << 11;
             }
         }
-        let pitch_base = pb + ctrls.master_tune + self.pitch_offset;
+        // The per-voice offset stands for the clock, not the pitch word:
+        // it is added after the pitch grid.
+        let off = self.pitch_offset;
+        let pitch_base = pb + ctrls.master_tune;
         pitch_mod += pitch_base;
 
         // ---- amp mod ----
@@ -386,15 +401,25 @@ impl Dx7Note {
             r.porta[0]
         };
 
+        let hw_env = self.hw_env && kernel == Kernel::MarkI;
+        // 14-bit attenuation per sample (EGS envelope << 2), Vintage only.
+        let mut eg = [[0i32; N]; 6];
         for op in 0..6 {
+            if hw_env {
+                self.egs[op].fill(clock, &mut eg[op]);
+            }
             if self.op_switch & (1 << op) == 0 {
-                self.env[op].getsample();
+                if hw_env {
+                    eg[op] = [EGS_OFF + 16; N];
+                } else {
+                    self.env[op].getsample();
+                }
                 self.params[op].level_in = 0;
                 continue;
             }
             let mut basepitch = self.basepitch[op];
             if self.op_mode[op] != 0 {
-                self.params[op].freq = r.freq.lookup(q(basepitch + pitch_base));
+                self.params[op].freq = r.freq.lookup(q(basepitch + pitch_base) + off);
             } else {
                 if self.porta_curpitch[op] != self.basepitch[op] {
                     basepitch = self.porta_curpitch[op];
@@ -410,9 +435,11 @@ impl Dx7Note {
                     }
                     self.porta_curpitch[op] = np;
                 }
-                self.params[op].freq = r.freq.lookup(q(basepitch + pitch_mod));
+                self.params[op].freq = r.freq.lookup(q(basepitch + pitch_mod) + off);
             }
-            let mut level = self.env[op].getsample();
+            // Level at the start of the block, Q24 (4096 units = silence).
+            let mut level = if hw_env { (4096 - eg[op][0]) << 16 } else { self.env[op].getsample() };
+            let level0 = level;
             if self.ampmodsens[op] != 0 {
                 let sensamp = ((u64::from(amd_mod) * u64::from(self.ampmodsens[op])) >> 24) as u32;
                 let pt = ((sensamp as f32) / 262144.0 * 0.07 + 12.2).exp() as u32;
@@ -420,12 +447,23 @@ impl Dx7Note {
                 level -= ldiff;
             }
             self.params[op].level_in = level;
+            if hw_env && level != level0 {
+                // Amplitude modulation and EG bias: held for the block,
+                // like the firmware's ~372 Hz modulation updates.
+                let am = (level0 - level) >> 16;
+                for g in eg[op].iter_mut() {
+                    *g += am;
+                }
+            }
         }
-        core.render(kernel, buf, &mut self.params, self.algorithm, &mut self.fb_buf, self.fb_shift, carrier_norm);
+        core.render(kernel, buf, &mut self.params, self.algorithm, &mut self.fb_buf, self.fb_shift, carrier_norm, if hw_env { Some(&eg) } else { None });
     }
 
     pub fn keyup(&mut self) {
         for e in &mut self.env {
+            e.keydown(false);
+        }
+        for e in &mut self.egs {
             e.keydown(false);
         }
         self.pitchenv.keydown(false);
@@ -435,6 +473,7 @@ impl Dx7Note {
     pub fn transfer_state(&mut self, src: &Dx7Note) {
         for i in 0..6 {
             self.env[i].transfer(&src.env[i]);
+            self.egs[i] = src.egs[i];
             self.params[i].gain_out = src.params[i].gain_out;
             self.params[i].phase = src.params[i].phase;
         }
@@ -453,6 +492,13 @@ impl Dx7Note {
         }
     }
 
+    /// Silence the envelopes at once (voice reset).
+    pub fn kill(&mut self) {
+        for e in &mut self.egs {
+            e.kill();
+        }
+    }
+
     pub fn osc_sync(&mut self) {
         for p in &mut self.params {
             p.gain_out = 0;
@@ -461,11 +507,11 @@ impl Dx7Note {
     }
 
     pub fn is_playing(&self) -> bool {
-        self.initialised && (0..6).any(|i| is_carrier(self.algorithm, i) && self.env[i].is_active())
+        self.initialised && (0..6).any(|i| is_carrier(self.algorithm, i) && if self.hw_env { self.egs[i].is_active() } else { self.env[i].is_active() })
     }
 
     /// Envelope stage of each operator (for the UI).
     pub fn stages(&self) -> [usize; 6] {
-        std::array::from_fn(|i| self.env[i].stage())
+        std::array::from_fn(|i| if self.hw_env { self.egs[i].stage() } else { self.env[i].stage() })
     }
 }

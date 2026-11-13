@@ -5,8 +5,8 @@
 //! Prints the load result (cartridge / single voice, checksum state) and
 //! the voice names, and renders each voice briefly to check it is finite.
 
-use dxdx7::dx7::{Engine, Settings};
-use dxdx7::sysex::{self, LoadQuality, Loaded};
+use shizuoka7::dx7::{Engine, Settings};
+use shizuoka7::sysex::{self, LoadQuality, Loaded};
 
 fn main() {
     let mut fails = 0;

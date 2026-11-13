@@ -100,10 +100,12 @@ fn dgain(g1: i32, g2: i32) -> i32 {
 impl Core {
     /// Render one block of one voice into `out` (overwritten).
     /// `carrier_norm`: apply the DX7's carrier-count compensation (Mark I kernel).
-    pub fn render(&mut self, kernel: Kernel, out: &mut [i32; N], params: &mut [OpParams; 6], algorithm: usize, fb_buf: &mut [i32; 2], fb_shift: i32, carrier_norm: bool) {
+    /// `eg`: per-sample operator attenuation from the EGS envelopes (12-bit
+    /// units); without it the block envelope in `params` is ramped.
+    pub fn render(&mut self, kernel: Kernel, out: &mut [i32; N], params: &mut [OpParams; 6], algorithm: usize, fb_buf: &mut [i32; 2], fb_shift: i32, carrier_norm: bool, eg: Option<&[[i32; N]; 6]>) {
         match kernel {
             Kernel::Modern => self.render_modern(out, params, algorithm, fb_buf, fb_shift),
-            Kernel::MarkI => self.render_mki(out, params, algorithm, fb_buf, fb_shift, carrier_norm),
+            Kernel::MarkI => self.render_mki(out, params, algorithm, fb_buf, fb_shift, carrier_norm, eg),
         }
     }
 
@@ -186,8 +188,45 @@ impl Core {
         }
     }
 
-    fn render_mki(&mut self, out: &mut [i32; N], params: &mut [OpParams; 6], algorithm: usize, fb_buf: &mut [i32; 2], fb_shift: i32, carrier_norm: bool) {
+    /// Attenuation of operator `op` for every sample of the block (14-bit,
+    /// 1024 per 6 dB), and whether any of it is audible.
+    /// `ramp`: interpolate from the previous block's value (Dexed does not
+    /// for the inner operators of a feedback chain).
+    fn mki_gains(params: &mut [OpParams; 6], op: usize, com: i32, eg: Option<&[[i32; N]; 6]>, ramp: bool) -> ([u16; N], bool) {
         const LEVEL_THRESH: i32 = ENV_MAX - 100;
+        let mut g = [0u16; N];
+        if let Some(eg) = eg {
+            // The chip adds the 12-bit envelope shifted up two bits, every
+            // sample, with no smoothing.
+            let mut lo = ENV_MAX;
+            for (g, &e) in g.iter_mut().zip(&eg[op]) {
+                let v = ((e << 2) + com).clamp(0, ENV_MAX);
+                lo = lo.min(v);
+                *g = v as u16;
+            }
+            params[op].gain_out = i32::from(g[N - 1]);
+            (g, lo <= LEVEL_THRESH)
+        } else {
+            let gain2 = (ENV_MAX - (params[op].level_in >> (28 - ENV_BITDEPTH)) + com).min(ENV_MAX);
+            let gain1 = if !ramp {
+                gain2
+            } else if params[op].gain_out == 0 {
+                ENV_MAX - 1
+            } else {
+                params[op].gain_out
+            };
+            params[op].gain_out = gain2;
+            let dg = dgain(gain1, gain2);
+            let mut gain = gain1;
+            for g in g.iter_mut() {
+                gain += dg;
+                *g = gain as u16;
+            }
+            (g, gain1 <= LEVEL_THRESH || gain2 <= LEVEL_THRESH)
+        }
+    }
+
+    fn render_mki(&mut self, out: &mut [i32; N], params: &mut [OpParams; 6], algorithm: usize, fb_buf: &mut [i32; 2], fb_shift: i32, carrier_norm: bool, eg: Option<&[[i32; N]; 6]>) {
         let t = tables();
         let com = if carrier_norm { COM[carrier_count(algorithm)] } else { 0 };
         let orig = ALGORITHMS[algorithm & 31];
@@ -198,6 +237,9 @@ impl Core {
         if (algorithm == 3 || algorithm == 5) && fb_on {
             alg[0] = 0xc4;
         }
+        // Attenuation (larger = quieter) added to carriers: this also
+        // weakens the feedback of a carrier that feeds back, as on the DX7.
+        let com_of = |op: usize| if orig[op] & OUT_BUS_ADD != 0 { com } else { 0 };
         let mut has = [true, false, false];
         let mut op = 0;
         while op < 6 {
@@ -205,16 +247,9 @@ impl Core {
             let mut add = flags & OUT_BUS_ADD != 0;
             let inbus = usize::from((flags >> 4) & 3);
             let outbus = usize::from(flags & 3);
-            let gain1 = if params[op].gain_out == 0 { ENV_MAX - 1 } else { params[op].gain_out };
-            let mut gain2 = ENV_MAX - (params[op].level_in >> (28 - ENV_BITDEPTH));
-            if orig[op] & OUT_BUS_ADD != 0 {
-                // Attenuation (larger = quieter): this also weakens the
-                // feedback of a carrier that feeds back, as on the DX7.
-                gain2 = (gain2 + com).min(ENV_MAX);
-            }
-            params[op].gain_out = gain2;
+            let (gain, audible) = Self::mki_gains(params, op, com_of(op), eg, true);
             let mut skip = 0;
-            if gain1 <= LEVEL_THRESH || gain2 <= LEVEL_THRESH {
+            if audible {
                 if !has[outbus] {
                     add = false;
                 }
@@ -223,36 +258,35 @@ impl Core {
                     let (o, _) = Self::bus_ptr(out, &mut self.bus, outbus, 0);
                     match algorithm {
                         3 => {
-                            mki_fb_chain::<3>(o, params, gain1, gain2, fb_buf, (fb_shift + 2).min(16), com);
+                            let g1 = Self::mki_gains(params, 1, com_of(1), eg, false).0;
+                            let g2 = Self::mki_gains(params, 2, com_of(2), eg, false).0;
+                            mki_fb_chain(o, params, &[&gain, &g1, &g2], fb_buf, (fb_shift + 2).min(16));
                             params[1].phase = params[1].phase.wrapping_add(params[1].freq << LG_N);
                             params[2].phase = params[2].phase.wrapping_add(params[2].freq << LG_N);
                             skip = 2;
                         }
                         5 => {
-                            mki_fb_chain::<2>(o, params, gain1, gain2, fb_buf, (fb_shift + 2).min(16), com);
+                            let g1 = Self::mki_gains(params, 1, com_of(1), eg, false).0;
+                            mki_fb_chain(o, params, &[&gain, &g1], fb_buf, (fb_shift + 2).min(16));
                             params[1].phase = params[1].phase.wrapping_add(params[1].freq << LG_N);
                             skip = 1;
                         }
-                        31 => mki_fb(o, &params[op], gain1, gain2, fb_buf, (fb_shift + 2).min(16), add),
-                        _ => mki_fb(o, &params[op], gain1, gain2, fb_buf, fb_shift, add),
+                        31 => mki_fb(o, &params[op], &gain, fb_buf, (fb_shift + 2).min(16), add),
+                        _ => mki_fb(o, &params[op], &gain, fb_buf, fb_shift, add),
                     }
                 } else {
                     let (o, input) = Self::bus_ptr(out, &mut self.bus, outbus, if input_live { inbus } else { 0 });
                     let p = &params[op];
-                    let dg = dgain(gain1, gain2);
-                    let mut gain = gain1;
                     let mut phase = p.phase;
                     if let Some(inp) = input {
                         for i in 0..N {
-                            gain += dg;
-                            let y = t.mki_sin(phase.wrapping_add(inp[i]), gain as u16);
+                            let y = t.mki_sin(phase.wrapping_add(inp[i]), gain[i]);
                             o[i] = if add { o[i].wrapping_add(y) } else { y };
                             phase = phase.wrapping_add(p.freq);
                         }
                     } else {
                         for i in 0..N {
-                            gain += dg;
-                            let y = t.mki_sin(phase, gain as u16);
+                            let y = t.mki_sin(phase, gain[i]);
                             o[i] = if add { o[i].wrapping_add(y) } else { y };
                             phase = phase.wrapping_add(p.freq);
                         }
@@ -268,18 +302,15 @@ impl Core {
     }
 }
 
-fn mki_fb(o: &mut [i32; N], p: &OpParams, gain1: i32, gain2: i32, fb_buf: &mut [i32; 2], fb_shift: i32, add: bool) {
+fn mki_fb(o: &mut [i32; N], p: &OpParams, gain: &[u16; N], fb_buf: &mut [i32; 2], fb_shift: i32, add: bool) {
     let t = tables();
-    let dg = dgain(gain1, gain2);
-    let mut gain = gain1;
     let mut phase = p.phase;
     let mut y0 = fb_buf[0];
     let mut y = fb_buf[1];
     for i in 0..N {
-        gain += dg;
         let scaled_fb = (y0.wrapping_add(y)) >> (fb_shift + 1);
         y0 = y;
-        y = t.mki_sin(phase.wrapping_add(scaled_fb), gain as u16);
+        y = t.mki_sin(phase.wrapping_add(scaled_fb), gain[i]);
         o[i] = if add { o[i].wrapping_add(y) } else { y };
         phase = phase.wrapping_add(p.freq);
     }
@@ -287,38 +318,24 @@ fn mki_fb(o: &mut [i32; N], p: &OpParams, gain1: i32, gain2: i32, fb_buf: &mut [
     fb_buf[1] = y;
 }
 
-/// Feedback through a chain of `K` operators (OP6 -> OP5 [-> OP4]), as in
-/// algorithms 6 (K = 2) and 4 (K = 3). Output overwrites `o`. The last
-/// operator of the chain is the carrier and gets the `com` attenuation.
-fn mki_fb_chain<const K: usize>(o: &mut [i32; N], parms: &mut [OpParams; 6], gain01: i32, gain02: i32, fb_buf: &mut [i32; 2], fb_shift: i32, com: i32) {
+/// Feedback through a chain of operators (OP6 -> OP5 [-> OP4]), as in
+/// algorithms 6 (two) and 4 (three). Output overwrites `o`; `gain` holds
+/// each operator's attenuation (the carrier's includes `COM`).
+fn mki_fb_chain(o: &mut [i32; N], parms: &[OpParams; 6], gain: &[&[u16; N]], fb_buf: &mut [i32; 2], fb_shift: i32) {
     let t = tables();
-    let mut gain = [0i32; K];
-    let mut dg = [0i32; K];
-    let mut phase = [0i32; K];
-    for k in 0..K {
+    let mut phase = [0i32; 3];
+    for k in 0..gain.len() {
         phase[k] = parms[k].phase;
-    }
-    gain[0] = gain01;
-    dg[0] = dgain(gain01, gain02);
-    for k in 1..K {
-        parms[k].gain_out = ENV_MAX - (parms[k].level_in >> (28 - ENV_BITDEPTH));
-        if k == K - 1 {
-            parms[k].gain_out = (parms[k].gain_out + com).min(ENV_MAX);
-        }
-        gain[k] = if parms[k].gain_out == 0 { ENV_MAX - 1 } else { parms[k].gain_out };
-        dg[k] = parms[k].gain_out - gain[k];
     }
     let mut y0 = fb_buf[0];
     let mut y = fb_buf[1];
-    for oi in o.iter_mut() {
+    for (i, oi) in o.iter_mut().enumerate() {
         let scaled_fb = (y0.wrapping_add(y)) >> (fb_shift + 1);
-        gain[0] += dg[0];
         y0 = y;
-        y = t.mki_sin(phase[0].wrapping_add(scaled_fb), gain[0] as u16);
+        y = t.mki_sin(phase[0].wrapping_add(scaled_fb), gain[0][i]);
         phase[0] = phase[0].wrapping_add(parms[0].freq);
-        for k in 1..K {
-            gain[k] += dg[k];
-            y = t.mki_sin(phase[k].wrapping_add(y), gain[k] as u16);
+        for k in 1..gain.len() {
+            y = t.mki_sin(phase[k].wrapping_add(y), gain[k][i]);
             phase[k] = phase[k].wrapping_add(parms[k].freq);
         }
         *oi = y;

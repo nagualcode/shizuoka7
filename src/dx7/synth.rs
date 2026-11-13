@@ -47,6 +47,12 @@ pub struct Synth {
     pub hw: HwModel,
     lfo_hold: (i32, i32),
     lfo_tick: u32,
+    /// Fill `Block::vint` (Vintage) instead of `Block::mix`.
+    pub vintage_out: bool,
+    /// The EGS envelope counter: one tick per sample, shared by all voices.
+    env_clock: u32,
+    /// Vintage: error of each 12-bit DAC code in LSBs (unit tolerance).
+    pub dac_err: Box<[f32; 4096]>,
 }
 
 /// Which parts of the DX7 hardware behaviour are modelled (Vintage engine).
@@ -59,10 +65,14 @@ pub struct HwModel {
     pub hw_pitch: bool,
     /// LFO / modulation updated at the firmware's ~372 Hz instead of per block.
     pub lfo_steps: bool,
+    /// Per-sample EGS envelopes instead of the block envelope.
+    pub hw_env: bool,
+    /// Apply `Synth::dac_err` (the DAC's bit-weight errors).
+    pub dac_bits: bool,
 }
 
 impl HwModel {
-    pub const OFF: HwModel = HwModel { dac: DacSw::Clean, dac_gain: [1.0; 4], carrier_norm: false, hw_pitch: false, lfo_steps: false };
+    pub const OFF: HwModel = HwModel { dac: DacSw::Clean, dac_gain: [1.0; 4], carrier_norm: false, hw_pitch: false, lfo_steps: false, hw_env: false, dac_bits: false };
 }
 
 /// DX7 per-voice converter (Shirriff, YM21280 part V; VDX7): the 15-bit
@@ -90,8 +100,31 @@ pub struct Block {
     /// Dexed's per-voice-clipped float mix (Modern / Mark I path).
     pub mix: [f32; N],
     /// Vintage path: sum of the voices after each voice's own DAC
-    /// conversion, in 15-bit DAC units (one full carrier = 16384).
+    /// conversion, in 15-bit DAC units (full scale = 16384).
     pub vint: [f32; N],
+    /// Vintage path: gain of the converter's own noise for each sample.
+    /// The analog /1../8 scaler sits after the DAC, so each voice slot
+    /// passes the DAC's noise at the gain of its range: 1.0 = all sixteen
+    /// slots idle (/8), rising with every loud voice.
+    pub dac_noise: [f32; N],
+}
+
+/// Analog scaler gain per DAC range (0 = loudest).
+const RANGE_GAIN: [f32; 4] = [8.0, 4.0, 2.0, 1.0];
+/// Noise power a voice slot adds over an idle one, per range, relative to
+/// sixteen idle slots.
+const RANGE_NOISE: [f32; 4] = [63.0 / 16.0, 15.0 / 16.0, 3.0 / 16.0, 0.0];
+
+impl Block {
+    pub fn new() -> Self {
+        Self { mix: [0.0; N], vint: [0.0; N], dac_noise: [1.0; N] }
+    }
+}
+
+impl Default for Block {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Synth {
@@ -117,6 +150,9 @@ impl Synth {
             hw: HwModel::OFF,
             lfo_hold: (1 << 23, 0),
             lfo_tick: 0,
+            vintage_out: false,
+            env_clock: 0,
+            dac_err: Box::new([0.0; 4096]),
         };
         s.lfo.reset(&s.rates, &s.patch[137..143]);
         s
@@ -207,6 +243,7 @@ impl Synth {
             v.keydown_seq = seq;
             let voice_steal = v.note.is_playing();
             v.note.hw_pitch = self.hw.hw_pitch;
+            v.note.hw_env = self.hw.hw_env;
             v.note.init(&self.rates, &self.patch, pitch, velo);
             v.note.pitch_offset = self.voice_pitch_offset[note];
             if osc_sync && !voice_steal {
@@ -305,6 +342,7 @@ impl Synth {
             v.keydown = false;
             v.live = false;
             v.sustained = false;
+            v.note.kill();
             v.note.osc_sync();
         }
     }
@@ -317,6 +355,7 @@ impl Synth {
                 v.live = false;
                 v.keydown = false;
                 v.midi_note = -1;
+                v.note.kill();
             }
         }
         self.polyphony = n;
@@ -337,6 +376,9 @@ impl Synth {
     pub fn render(&mut self, out: &mut Block) {
         out.mix = [0.0; N];
         out.vint = [0.0; N];
+        out.dac_noise = [1.0; N];
+        let clock = self.env_clock;
+        self.env_clock = clock.wrapping_add(N as u32);
         let (lfo_val, lfo_delay) = if self.hw.lfo_steps {
             // The firmware updates LFO and modulation every ~132 samples
             // at 49.1 kHz (about two blocks): advance twice, hold twice.
@@ -361,23 +403,39 @@ impl Synth {
             }
             // The core adds carriers into this buffer ("has content" starts true).
             self.voice_buf = [0; N];
-            v.note.compute(&self.rates, &mut self.core, self.kernel, &mut self.voice_buf, lfo_val, lfo_delay, &self.ctrls, hw.carrier_norm);
+            v.note.compute(&self.rates, &mut self.core, self.kernel, &mut self.voice_buf, lfo_val, lfo_delay, &self.ctrls, hw.carrier_norm, clock);
+            if !self.vintage_out {
+                for j in 0..N {
+                    let val = self.voice_buf[j];
+                    // Dexed: >> 4, clip to 16 bits per voice, then float.
+                    let v4 = val >> 4;
+                    let clip = if v4 < -(1 << 24) { -0x8000 } else if v4 >= (1 << 24) { 0x7fff } else { v4 >> 9 };
+                    out.mix[j] += clip as f32 / 32768.0;
+                }
+                continue;
+            }
             for j in 0..N {
                 let val = self.voice_buf[j];
-                // Voice to 15-bit DAC word: one full carrier (2^25) = 16384.
-                let v15 = (val >> 11).clamp(-16384, 16383);
+                // Voice to the chip's 15-bit output word. The core's values
+                // are the chip's shifted up 12 bits (its full scale, 2^26,
+                // is the chip's 16384; a level-99 carrier peaks at half).
+                let v15 = (val >> 12).clamp(-16384, 16383);
                 out.vint[j] += match hw.dac {
-                    DacSw::Clean => val as f32 / 2048.0,
+                    DacSw::Clean => val as f32 / 4096.0,
                     DacSw::Dx7 => {
                         let (q, r) = dx7_dac(v15);
-                        q as f32 * hw.dac_gain[r]
+                        out.dac_noise[j] += RANGE_NOISE[r];
+                        if hw.dac_bits {
+                            // 12-bit code as the DAC sees it, with its
+                            // bit-weight errors, then the analog scaler.
+                            let code = q >> (3 - r);
+                            (code as f32 + self.dac_err[(code + 2048) as usize]) * RANGE_GAIN[r] * hw.dac_gain[r]
+                        } else {
+                            q as f32 * hw.dac_gain[r]
+                        }
                     }
                     DacSw::Flat12 => (v15 & !7) as f32,
                 };
-                // Dexed: >> 4, clip to 16 bits per voice, then float.
-                let v4 = val >> 4;
-                let clip = if v4 < -(1 << 24) { -0x8000 } else if v4 >= (1 << 24) { 0x7fff } else { v4 >> 9 };
-                out.mix[j] += clip as f32 / 32768.0;
             }
         }
     }

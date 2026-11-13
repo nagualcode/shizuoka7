@@ -260,7 +260,7 @@ def open_globals():
             range = "linear(0, 1)", default = 0.0, format = "fmt_percent")]
     pub drive: FloatParam,
     #[param(id = 44, name = "Unit Tolerance", short_name = "Toler", group = "Vintage",
-            range = "linear(0, 1)", default = 0.0, format = "fmt_percent")]
+            range = "linear(0, 1)", default = 0.3, format = "fmt_percent")]
     pub tolerance: FloatParam,
     #[param(id = 45, name = "Hardware Pitch", short_name = "HW Pitch", group = "Vintage", default = true)]
     pub hw_pitch: BoolParam,
@@ -268,6 +268,8 @@ def open_globals():
     pub carrier_norm: BoolParam,
     #[param(id = 47, name = "LFO Steps", short_name = "LFO Stp", group = "Vintage", default = true)]
     pub lfo_steps: BoolParam,
+    #[param(id = 48, name = "EGS Envelopes", short_name = "EGS Env", group = "Vintage", default = true)]
+    pub hw_env: BoolParam,
 
     // --- Hidden MIDI proxies (VST3 IMidiMapping; CLAP/AU get raw MIDI) ---
     #[param(id = 90, name = "Pitch Bend", range = "linear(-1, 1)", default = 0.0,

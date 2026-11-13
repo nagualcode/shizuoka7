@@ -683,26 +683,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
-name = "dxdx7"
-version = "0.2.1"
-dependencies = [
- "clap-sys",
- "egui",
- "hound",
- "rfd",
- "truce",
- "truce-au",
- "truce-clap",
- "truce-core",
- "truce-egui",
- "truce-font",
- "truce-params",
- "truce-standalone",
- "truce-test",
- "truce-vst3",
-]
-
-[[package]]
 name = "ecolor"
 version = "0.34.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2422,6 +2402,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "shizuoka7"
+version = "0.3.0"
+dependencies = [
+ "clap-sys",
+ "egui",
+ "hound",
+ "rfd",
+ "truce",
+ "truce-au",
+ "truce-clap",
+ "truce-core",
+ "truce-egui",
+ "truce-font",
+ "truce-params",
+ "truce-standalone",
+ "truce-test",
+ "truce-vst3",
 ]
 
 [[package]]
