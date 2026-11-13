@@ -37,7 +37,7 @@ jobs:
       matrix:
         include:
           - name: macOS (Apple Silicon)
-            os: macos-14
+            os: macos-15
             slug: macOS-arm64
             formats: --au2 --vst3 --clap
             cpu: ""
