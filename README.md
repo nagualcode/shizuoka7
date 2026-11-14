@@ -1,7 +1,3 @@
-<a class="bmc" href="https://buymeacoffee.com/jardimsonoro" rel="noopener">
-    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" width="217" height="60" loading="lazy">
-</a>
-
 # SHIZUOKA7
 
 **Six operators, thirty-two algorithms, one slightly noisy 12-bit DAC. By Jardim Sonoro.**
@@ -85,10 +81,6 @@ xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/Components/Shizuoka7.com
 (same for the `.vst3` / `.clap`). The Windows and Linux builds pass the
 same tests in CI but have not been tried in a DAW yet; reports welcome.
 
-> **Coming from DXDX7?** That was this plug-in's name until version 0.3.
-> Shizuoka7 has a new plug-in ID, so DAW projects saved with DXDX7 will not
-> find it automatically: keep the old plug-in installed for old projects,
-> or save your voices as `.syx` and load them here.
 
 **From source** (needs Rust; on Linux the X11 / OpenGL / ALSA / JACK
 development packages listed in `.github/workflows/build.yml`):
